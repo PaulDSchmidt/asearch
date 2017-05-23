@@ -1,0 +1,259 @@
+#!/usr/bin/perl -w
+
+# asearch
+#
+# version 2.0 - converted the old asearch to use Net::LDAP - May 1, 2002
+# version 2.1 - default to SSL connection - Jan 7, 2014
+# version 2.2 - added -F batch processing from adsearch - Oct 13, 2015
+# version 2.3 - added -R as batch processing option and -1 and -T -- Nov, 2016
+#
+# Written by Paul Schmidt
+
+$VERSION = "2.3";
+
+use Getopt::Std;		# for option handling (duh)
+use Net::LDAP::Util qw(ldap_error_text ldap_error_name);
+use Net::LDAP;
+
+$LdapHost = "oud.dartmouth.edu";
+#$LdapPort = "389";
+$LdapPort = "636";
+$cafile = "/etc/thawte.pem";
+#$LdapSecure = 0;
+$LdapSecure = 1;
+$LdapUser = "";
+$LdapPass = "";
+
+$Filter = "(objectclass=inetOrgPerson)";
+$BaseDN = "dc=dartmouth,dc=edu";
+$SearchType = "sub";
+
+my $GlobPattern = "/^.*$/";
+
+$|++;
+my $DEBUG_STATE = 0;
+my $BATCH = 0;
+my $BATCH_REGEX = 0;
+my $SINGLE_LINE = 0;
+my $ATTRIBS = 0;
+my $SHOW_TAGS = 1;
+
+unless ( getopts('hda:b:F:f:U:P:s:p:t:Sc:R:1T') )
+  { &usageMessage; cleanup(1); }
+
+if ($opt_h=$opt_h) { &usageMessage; cleanup(0); }
+if ($arg = shift) { $Filter = "($arg)"; }
+if ($opt_a) { $ATTRIBS++; @SearchAttribs = &newAttribs($opt_a); }
+if ($opt_b) { $BaseDN = &newBaseDN($opt_b); }
+if ($opt_d) { $DEBUG_STATE = $opt_d; }
+if ($opt_1=$opt_1) { $SINGLE_LINE++; }
+if ($opt_T=$opt_T) { $SHOW_TAGS = 0; }
+if ($opt_f) { $Filter = "($opt_f)"; }
+if ($opt_F)
+{
+  $BATCH++;
+  $FilterBase = $opt_F;
+  if ($opt_R)
+  {
+    $BATCH_REGEX++;
+    $GlobPattern = $opt_R;
+  }
+}
+if ($opt_U) { $LdapUser = $opt_U; }
+if ($opt_P) { $LdapPass = $opt_P; }
+if ($opt_s) { $LdapHost = $opt_s; }
+if ($opt_t) { $SearchType = $opt_t; }
+if ($opt_S) { $LdapPort = "636"; $LdapSecure = $opt_S }
+if ($opt_c) { $cafile = $opt_c; }
+if ($opt_p) { $LdapPort = $opt_p; }
+
+if ($opt_P && !$opt_U)
+{
+  print "\n\nusername: ";
+  chomp ($LdapUser = <STDIN>);
+}
+
+if ($opt_U && !$opt_P)
+{
+  print "password: ";
+  system ("stty -echo");
+  chomp ($LdapPass = <STDIN>);
+  system ("stty echo");
+  print "\n";
+}
+
+$uri = "$LdapHost:$LdapPort";
+$uri = (($LdapSecure) ? "ldaps://" : "ldap://") . $uri;
+$conn = Net::LDAP->new($uri);
+$conn->start_tls(verify => 'require', cafile => $cafile) if($LdapSecure);
+die "Couldn't connect to LDAP server $LdapHost: $!" unless $conn;
+print STDERR "Ready to bind.\n" if $DEBUG_STATE;
+$conn->bind( "$LdapUser",
+             password => "$LdapPass",
+	     timeout => 30,
+	     debug => 15,
+	     version => 3 );
+LOOKUP: while(1)
+{
+  my $batch_text;
+  if ($BATCH)
+  {
+    my $this_filter = <STDIN>;
+    chomp $this_filter;
+    $batch_text = $this_filter;
+    if ($BATCH_REGEX)
+    {
+      $this_filter =~ m/$GlobPattern/;
+      print "GlobPattern .$GlobPattern.\n" if $DEBUG_STATE;
+      $this_filter = $&;
+      print "Filter .$this_filter. and & .$&.\n" if $DEBUG_STATE;
+    }
+    last LOOKUP unless $this_filter;
+    chomp $this_filter;
+    $this_filter =~ s/^\s+|\s+$//g;
+    $Filter = "($FilterBase=$this_filter)";
+  }
+
+  print $batch_text if $BATCH && $BATCH_REGEX;
+  &lookup;
+
+  last LOOKUP unless $BATCH;
+}
+
+
+
+
+$conn->unbind;
+
+&cleanup(0);
+
+### End of main program and start of subroutines ###
+
+sub lookup
+{
+  print STDERR "Done with bind. Ready to search.\n" if $DEBUG_STATE;
+    
+  $mesg = $conn->search( base => $BaseDN,
+                         scope => $SearchType,
+  		       filter => $Filter,
+  		       attrs => \@SearchAttribs );
+    
+  print STDERR "Done with search.\n" if $DEBUG_STATE;
+  my $TERM = "\n";
+  $TERM = '  ' if $SINGLE_LINE;
+
+  if ($mesg->count == 0)
+    { print STDERR "Couldn't find any entries for $Filter!$TERM"; }
+  else
+  {
+    foreach $entry ($mesg->entries)
+    {
+  
+      if ( $ATTRIBS && !$SINGLE_LINE )
+        { print $SHOW_TAGS ? "dn: " : ''; print $entry->dn . $TERM; }
+      foreach $attr ( $entry->attributes() )
+      {
+        foreach $value ( $entry->get_value($attr) )
+        {
+          if ($attr eq 'photo')
+            { print $SHOW_TAGS ? "$attr: " : ''; print "(photo)$TERM"; }
+          elsif ($attr =~ /;binary$/)
+            { print $SHOW_TAGS ? "$attr: " : ''; print "(binary data)$TERM"; }
+          else
+            { print $SHOW_TAGS ? "$attr: " : ''; print $value . $TERM; }
+        }
+      }
+      print $TERM;
+    }
+  }
+  print "\n";
+}
+
+# take a DN as an arg and return a cleaned up, fully-qualified version of it
+sub newBaseDN
+{
+  my $newDn = shift;
+
+  if (!$newDn) { return "dc=dartmouth,dc=edu"; }
+  if ($newDn =~ /dc=dartmouth,dc=edu$/i) { return $newDn; }
+  $newDn .= ",dc=dartmouth,dc=edu";
+  if ($newDn =~ /ou=/i) { return $newDn; }
+  return "ou=$newDn";
+}
+
+# take a comma separated list of attribs and return them as an array
+sub newAttribs
+{
+  my $attribs = shift;
+  my @newAttribs;
+
+  while ($attribs)	# put comma separated list from opt_a into newAttribs
+  {
+    ($myArg, $attribs) = split(/,/, $attribs, 2);
+    $myArg =~ s/(^(\s+|'|")|(\s+|'|")$)//g;
+    $myArg =~ s/\s+/ /g;
+    push(@newAttribs, $myArg);
+  }
+  return @newAttribs;
+}
+
+sub cleanup
+{
+  my $exitVal = shift;
+  exit $exitVal;
+}
+
+sub usageMessage
+{
+  print <<"EndOfUsage";
+
+usage: asearch [-d] [-a <attribs>] [-b <baseDN>] [-s <server>] [-p <port>] [-1] [-T]
+               [[-U <user>] [-P <passwd>]] [-F <filter> [-R <regex>]] [[-f] <filter>]
+       asearch -h
+
+asearch displays the results of an LDAP search.
+
+-F <filter> : set filter attrib for batch processing from <STDIN>
+-R <regex>  : use <regex> for string matching attribute for -F
+-1          : output on a single line
+-T          : supress attribute tags
+-a <attribs>: A comma separated string of attributes to return.  Defaults
+              to return all attributes.
+-b <baseDN> : A fully qualified DN at which to begin the search.  Defaults
+	      to "$BaseDN".
+-f <filter> : An LDAP search filter to apply.  If no other arguments are
+              specified then the "-f" may be omitted.  Defaults to
+	      "$Filter".
+-t <type>   : Type of search to conduct.  Defaults to "$SearchType".
+-s <server> : LDAP server to which to connect.  Defaults to "$LdapHost".
+-p <port>   : Port number to which to connect.  Defaults to "$LdapPort".
+-S          : Use SSL, changes default port to "636".
+-d          : enable some debugging
+-c <cafile> : CA file to use for server verification for SSL. The default
+            : is "$cafile", which covers "$LdapHost".
+-U <user>   : FQDN to use when connecting.  Defaults to the proxy user.
+-P <passwd> : Password to use when connecting.
+-h          : display this usage message.
+
+If either, but not both, of -U or -P is specified then asearch will
+prompt the user for the missing information.  Valid options for -t are
+base, sub or one.
+
+EXAMPLES
+
+authenticated search:
+
+asearch -f cn=dawsons -a "acl" -U 'cn=dawsons,ou=information technology,o=augsburg'
+
+list of all users:
+
+asearch -a dn
+
+phone number of everyone in Information Technology:
+
+asearch -a telephonenumber -b 'ou=information technology,o=augsburg'
+
+version $VERSION
+EndOfUsage
+}
+
